@@ -2,11 +2,16 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
+	"os/signal"
 	"runtime"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/mattn/go-isatty"
 
@@ -21,6 +26,7 @@ import (
 	"citeoai/internal/tools"
 	"citeoai/internal/tui"
 	"citeoai/internal/version"
+	"citeoai/internal/web"
 )
 
 func main() {
@@ -53,6 +59,8 @@ func main() {
 			os.Exit(1)
 		}
 		runTUI(cfg)
+	case "serve":
+		runServe(args)
 	case "memory":
 		runMemory(args)
 	case "skill":
@@ -74,6 +82,7 @@ func printUsage() {
 	fmt.Println("  doctor     Run preflight diagnostic checks")
 	fmt.Println("  run        Execute a single prompt or task")
 	fmt.Println("  tui        Launch the interactive terminal UI")
+	fmt.Println("  serve      Start HTTP and WebSocket server for remote control")
 	fmt.Println("  session    Manage conversation sessions")
 	fmt.Println("  skill      Manage markdown skills")
 	fmt.Println("  memory     Manage persistent memory journal")
@@ -122,6 +131,46 @@ func runTUI(cfg *config.Config) {
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "tui error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func runServe(args []string) {
+	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+	portFlag := fs.Int("port", 8088, "server port")
+	distFlag := fs.String("dist", "/opt/data/home/ui-citeoai/dist", "static dist directory")
+	configFlag := fs.String("config", "", "config file path")
+	_ = fs.Parse(args)
+
+	cfg, err := config.LoadConfig(*configFlag)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "configuration error: %v\n", err)
+		os.Exit(1)
+	}
+
+	orch, err := buildOrchestrator(cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "orchestrator error: %v\n", err)
+		os.Exit(1)
+	}
+
+	srv := web.NewServer(web.ServerConfig{
+		Port:    *portFlag,
+		DistDir: *distFlag,
+	}, orch)
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Stop(ctx)
+	}()
+
+	fmt.Printf("CITEOAI Web Server listening on port %d\n", *portFlag)
+	if err := srv.Start(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		fmt.Fprintf(os.Stderr, "server error: %v\n", err)
 		os.Exit(1)
 	}
 }
