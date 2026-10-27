@@ -1,0 +1,35 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/bin/
+/dist/
+/citeoai
+
+# Environment & Secrets (env-secrets-management)
+.env
+.env.*
+!.env.example
+credentials.json
+jwt-secret
+*.key
+*.pem
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Test & Profiling outputs
+*.pprof
+*.test
+coverage.out
+__debug_bin*
+
+# Runtime data
+.citeoai/
+logs/
+tmp/
