@@ -445,11 +445,18 @@ func (s *Server) executePrompt(ctx context.Context, sessionID string, promptText
 	s.mu.RUnlock()
 
 	if runner == nil {
+		errStr := "runner not configured"
+		errText := fmt.Sprintf("Provider Error: %s", errStr)
+		_ = sendEvent(ServerEvent{
+			Type:      "error",
+			SessionID: sessionID,
+			Error:     errStr,
+		})
 		_ = sendEvent(ServerEvent{
 			Type:      "done",
 			SessionID: sessionID,
-			FinalText: "Error: runner not configured",
-			Error:     "runner not configured",
+			FinalText: errText,
+			Error:     errStr,
 		})
 		return
 	}
@@ -615,10 +622,16 @@ func (s *Server) executePrompt(ctx context.Context, sessionID string, promptText
 
 	result, err := runner.RunTurn(ctx, promptText, streamCallback, logCallback)
 	if err != nil {
+		errText := fmt.Sprintf("Provider Error: %v", err)
+		_ = sendEvent(ServerEvent{
+			Type:      "error",
+			SessionID: sessionID,
+			Error:     err.Error(),
+		})
 		_ = sendEvent(ServerEvent{
 			Type:      "done",
 			SessionID: sessionID,
-			FinalText: result,
+			FinalText: errText,
 			Error:     err.Error(),
 		})
 		return
@@ -790,7 +803,12 @@ function connect() {
         out.textContent += "\n[Tool Log] " + data.output;
       } else if (data.type === "tool_end") {
         out.textContent += "\n[Tool End] " + data.name + " (success: " + data.success + ")";
+      } else if (data.type === "error") {
+        out.textContent += "\n[Error] " + (data.error || "");
       } else if (data.type === "done") {
+        if (data.error && data.final_text) {
+          out.textContent += "\n" + data.final_text;
+        }
         out.textContent += "\n[Done]\n";
       } else if (data.type === "projects") {
         out.textContent += "\n[Projects] " + JSON.stringify(data.projects);

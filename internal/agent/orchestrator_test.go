@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -439,5 +440,129 @@ func TestOrchestratorGettersAndNilProvider(t *testing.T) {
 	_, err := orch.RunTurn(context.Background(), "test", nil, nil)
 	if !errors.Is(err, ErrNilProvider) {
 		t.Fatalf("expected ErrNilProvider, got %v", err)
+	}
+}
+
+func TestCLIRunnerRunTurn(t *testing.T) {
+	tmpDir := t.TempDir()
+	scriptPath := filepath.Join(tmpDir, "mock_agy.sh")
+	scriptContent := `#!/bin/sh
+echo '{"event":"step_update","step_update":{"conversation_id":"c1","step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"hello "}}'
+echo '{"event":"step_update","step_update":{"conversation_id":"c1","step_index":1,"state":"ACTIVE","step_type":"thought","thought":"deep thought"}}'
+echo '{"event":"step_update","step_update":{"conversation_id":"c1","step_index":2,"state":"ACTIVE","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","parameters":{"cmd":"whoami"}}}}'
+echo '{"event":"step_update","step_update":{"conversation_id":"c1","step_index":2,"state":"DONE","step_type":"tool","tool_name":"run_command"}}'
+echo '{"event":"step_update","step_update":{"conversation_id":"c1","step_index":3,"state":"ACTIVE","step_type":"agent_response","text_delta":"world"}}'
+echo '{"event":"result","result":{"status":"SUCCESS","response":"hello world"}}'
+`
+	if err := os.WriteFile(scriptPath, []byte(scriptContent), 0o755); err != nil {
+		t.Fatalf("failed to write mock script: %v", err)
+	}
+
+	runner := NewCLIRunner(scriptPath, tmpDir, "gemini-3.8-flash-high")
+
+	var tokens []string
+	var thoughts []string
+	var logs []string
+
+	streamCb := func(tok string) {
+		if strings.HasPrefix(tok, "thought:") {
+			thoughts = append(thoughts, strings.TrimPrefix(tok, "thought:"))
+		} else {
+			tokens = append(tokens, tok)
+		}
+	}
+
+	logCb := func(entry string) {
+		logs = append(logs, entry)
+	}
+
+	res, err := runner.RunTurn(context.Background(), "run prompt", streamCb, logCb)
+	if err != nil {
+		t.Fatalf("unexpected runner error: %v", err)
+	}
+
+	if res != "hello world" {
+		t.Errorf("expected result 'hello world', got: %s", res)
+	}
+
+	joinedTokens := strings.Join(tokens, "")
+	if joinedTokens != "hello world" {
+		t.Errorf("expected streamed tokens 'hello world', got: %s", joinedTokens)
+	}
+
+	if len(thoughts) != 1 || thoughts[0] != "deep thought" {
+		t.Errorf("expected thought 'deep thought', got: %v", thoughts)
+	}
+
+	var hasToolStart bool
+	var hasToolEnd bool
+	for _, l := range logs {
+		if strings.HasPrefix(l, "tool_start: run_command") && strings.Contains(l, `"cmd":"whoami"`) {
+			hasToolStart = true
+		}
+		if l == "tool executed: run_command" {
+			hasToolEnd = true
+		}
+	}
+
+	if !hasToolStart {
+		t.Errorf("missing tool_start in logs: %v", logs)
+	}
+	if !hasToolEnd {
+		t.Errorf("missing tool executed in logs: %v", logs)
+	}
+}
+
+func TestOrchestratorFallbackToCLIRunner(t *testing.T) {
+	tmpDir := t.TempDir()
+	scriptPath := filepath.Join(tmpDir, "mock_agy.sh")
+	scriptContent := `#!/bin/sh
+echo '{"event":"step_update","step_update":{"conversation_id":"c1","step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"from cli"}}'
+echo '{"event":"result","result":{"status":"SUCCESS","response":"from cli"}}'
+`
+	if err := os.WriteFile(scriptPath, []byte(scriptContent), 0o755); err != nil {
+		t.Fatalf("failed to write mock script: %v", err)
+	}
+
+	cliRunner := NewCLIRunner(scriptPath, tmpDir, "gemini-3.8-flash-high")
+
+	cfgEmptyKey := config.DefaultConfig()
+	cfgEmptyKey.APIKey = ""
+
+	mockProv := &mockProvider{
+		streamFunc: func(ctx context.Context, messages []interfaces.Message, tools []interfaces.ToolDefinition) (<-chan interfaces.StreamChunk, error) {
+			ch := make(chan interfaces.StreamChunk, 1)
+			ch <- interfaces.StreamChunk{DeltaText: "from provider", Done: true}
+			close(ch)
+			return ch, nil
+		},
+	}
+
+	orch := NewOrchestrator(&cfgEmptyKey, mockProv, nil, nil, nil)
+	orch.SetCLIRunner(cliRunner)
+
+	if orch.CLIRunner() != cliRunner {
+		t.Errorf("expected cliRunner getter to return set instance")
+	}
+
+	res, err := orch.RunTurn(context.Background(), "test", nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res != "from cli" {
+		t.Errorf("expected 'from cli' when APIKey is empty, got: %s", res)
+	}
+
+	cfgWithKey := config.DefaultConfig()
+	cfgWithKey.APIKey = "actual_api_key_123"
+	orchWithKey := NewOrchestrator(&cfgWithKey, mockProv, nil, nil, nil)
+	orchWithKey.SetCLIRunner(cliRunner)
+
+	resProv, err := orchWithKey.RunTurn(context.Background(), "test", nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resProv != "from provider" {
+		t.Errorf("expected 'from provider' when APIKey is configured, got: %s", resProv)
 	}
 }

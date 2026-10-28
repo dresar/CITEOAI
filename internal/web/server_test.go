@@ -477,18 +477,43 @@ func TestWebSocketPromptRunnerError(t *testing.T) {
 		t.Fatalf("send error: %v", err)
 	}
 
-	var evt ServerEvent
+	var receivedEvents []ServerEvent
 	for {
+		var evt ServerEvent
 		if err := websocket.JSON.Receive(ws, &evt); err != nil {
 			t.Fatalf("receive error: %v", err)
 		}
+		receivedEvents = append(receivedEvents, evt)
 		if evt.Type == "done" {
 			break
 		}
 	}
 
-	if evt.Error != "provider timeout" {
-		t.Errorf("expected provider timeout error, got: %s", evt.Error)
+	var hasError bool
+	var doneEvt *ServerEvent
+	for i := range receivedEvents {
+		if receivedEvents[i].Type == "error" {
+			hasError = true
+			if receivedEvents[i].Error != "provider timeout" {
+				t.Errorf("unexpected error event message: %s", receivedEvents[i].Error)
+			}
+		}
+		if receivedEvents[i].Type == "done" {
+			doneEvt = &receivedEvents[i]
+		}
+	}
+
+	if !hasError {
+		t.Errorf("expected error event, got none")
+	}
+	if doneEvt == nil {
+		t.Fatalf("missing done event")
+	}
+	if doneEvt.Error != "provider timeout" {
+		t.Errorf("expected provider timeout error, got: %s", doneEvt.Error)
+	}
+	if doneEvt.FinalText != "Provider Error: provider timeout" {
+		t.Errorf("expected FinalText 'Provider Error: provider timeout', got: %s", doneEvt.FinalText)
 	}
 }
 

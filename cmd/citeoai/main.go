@@ -115,7 +115,16 @@ func buildOrchestrator(cfg *config.Config) (*agent.AgentOrchestrator, error) {
 		return nil, fmt.Errorf("memory initialization failed: %w", err)
 	}
 	skills, _ := skill.DiscoverSkills(nil)
-	return agent.NewOrchestrator(cfg, prov, registry, memStore, skills), nil
+	orch := agent.NewOrchestrator(cfg, prov, registry, memStore, skills)
+
+	agyPath := "/opt/data/home/.local/bin/agy"
+	if strings.TrimSpace(cfg.APIKey) == "" {
+		if _, statErr := os.Stat(agyPath); statErr == nil {
+			orch.SetCLIRunner(agent.NewCLIRunner(agyPath, "/opt/data/home/agy-profiles/account1", "gemini-3.8-flash-high"))
+		}
+	}
+
+	return orch, nil
 }
 
 func runTUI(cfg *config.Config) {

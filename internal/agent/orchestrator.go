@@ -1,10 +1,14 @@
 package agent
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"os"
+	"os/exec"
 	"strings"
 
 	"citeoai/internal/config"
@@ -36,6 +40,7 @@ type AgentOrchestrator struct {
 	mem              *memory.MemoryStore
 	skills           []skill.Skill
 	securityApprover SecurityApprover
+	cliRunner        *CLIRunner
 }
 
 func NewOrchestrator(cfg *config.Config, prov interfaces.Provider, tools *tools.ToolRegistry, mem *memory.MemoryStore, skills []skill.Skill) *AgentOrchestrator {
@@ -46,6 +51,14 @@ func NewOrchestrator(cfg *config.Config, prov interfaces.Provider, tools *tools.
 		mem:    mem,
 		skills: skills,
 	}
+}
+
+func (o *AgentOrchestrator) SetCLIRunner(runner *CLIRunner) {
+	o.cliRunner = runner
+}
+
+func (o *AgentOrchestrator) CLIRunner() *CLIRunner {
+	return o.cliRunner
 }
 
 func (o *AgentOrchestrator) SetSecurityApprover(approver SecurityApprover) {
@@ -172,6 +185,10 @@ func isTier3Command(toolName, argsJSON string) (bool, string) {
 }
 
 func (o *AgentOrchestrator) RunTurn(ctx context.Context, prompt string, streamCallback func(token string), logCallback func(entry string)) (string, error) {
+	if (o.cfg == nil || strings.TrimSpace(o.cfg.APIKey) == "") && o.cliRunner != nil {
+		return o.cliRunner.RunTurn(ctx, prompt, streamCallback, logCallback)
+	}
+
 	if o.prov == nil {
 		return "", ErrNilProvider
 	}
@@ -360,4 +377,201 @@ func (o *AgentOrchestrator) RunTurn(ctx context.Context, prompt string, streamCa
 	}
 
 	return accumulatedFinalText.String(), ErrMaxTurnsExceeded
+}
+
+type CLIRunner struct {
+	AgyPath string
+	HomeDir string
+	Model   string
+}
+
+func NewCLIRunner(agyPath, homeDir, model string) *CLIRunner {
+	if agyPath == "" {
+		agyPath = "/opt/data/home/.local/bin/agy"
+	}
+	if homeDir == "" {
+		homeDir = "/opt/data/home/agy-profiles/account1"
+	}
+	if model == "" {
+		model = "gemini-3.8-flash-high"
+	}
+	return &CLIRunner{
+		AgyPath: agyPath,
+		HomeDir: homeDir,
+		Model:   model,
+	}
+}
+
+type agyNDJSONMessage struct {
+	Event      string         `json:"event"`
+	Type       string         `json:"type"`
+	Thought    string         `json:"thought"`
+	Delta      string         `json:"delta"`
+	StepUpdate *agyStepUpdate `json:"step_update"`
+	Result     *agyResult     `json:"result"`
+	Error      string         `json:"error"`
+}
+
+type agyStepUpdate struct {
+	StepIndex int          `json:"step_index"`
+	State     string       `json:"state"`
+	StepType  string       `json:"step_type"`
+	TextDelta string       `json:"text_delta"`
+	Thought   string       `json:"thought"`
+	ToolName  string       `json:"tool_name"`
+	ToolInfo  *agyToolInfo `json:"tool_info"`
+}
+
+type agyToolInfo struct {
+	Name       string          `json:"name"`
+	Parameters json.RawMessage `json:"parameters"`
+	Args       json.RawMessage `json:"args"`
+}
+
+type agyResult struct {
+	Status   string `json:"status"`
+	Response string `json:"response"`
+}
+
+func (r *CLIRunner) RunTurn(ctx context.Context, prompt string, streamCallback func(token string), logCallback func(entry string)) (string, error) {
+	agyPath := r.AgyPath
+	if agyPath == "" {
+		agyPath = "/opt/data/home/.local/bin/agy"
+	}
+	homeDir := r.HomeDir
+	if homeDir == "" {
+		homeDir = "/opt/data/home/agy-profiles/account1"
+	}
+	model := r.Model
+	if model == "" {
+		model = "gemini-3.8-flash-high"
+	}
+
+	cmd := exec.CommandContext(ctx, agyPath, "-p", prompt, "--model", model, "--effort", "high", "--output-format", "stream-json")
+
+	env := os.Environ()
+	replaced := false
+	for i, e := range env {
+		if strings.HasPrefix(e, "HOME=") {
+			env[i] = "HOME=" + homeDir
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		env = append(env, "HOME="+homeDir)
+	}
+	cmd.Env = env
+
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return "", err
+	}
+
+	var stderrBuf strings.Builder
+	cmd.Stderr = &stderrBuf
+
+	if err := cmd.Start(); err != nil {
+		return "", err
+	}
+
+	var accumulatedText strings.Builder
+	var finalResponse string
+
+	reader := bufio.NewReader(stdoutPipe)
+	for {
+		line, readErr := reader.ReadString('\n')
+		line = strings.TrimSpace(line)
+		if line != "" {
+			var msg agyNDJSONMessage
+			if jsonErr := json.Unmarshal([]byte(line), &msg); jsonErr == nil {
+				if msg.Event == "step_update" && msg.StepUpdate != nil && msg.StepUpdate.TextDelta != "" && msg.StepUpdate.StepType != "thought" {
+					accumulatedText.WriteString(msg.StepUpdate.TextDelta)
+					if streamCallback != nil {
+						streamCallback(msg.StepUpdate.TextDelta)
+					}
+				}
+
+				thoughtText := ""
+				if msg.StepUpdate != nil {
+					if msg.StepUpdate.Thought != "" {
+						thoughtText = msg.StepUpdate.Thought
+					} else if msg.StepUpdate.StepType == "thought" && msg.StepUpdate.TextDelta != "" {
+						thoughtText = msg.StepUpdate.TextDelta
+					}
+				}
+				if thoughtText == "" {
+					if msg.Thought != "" {
+						thoughtText = msg.Thought
+					} else if (msg.Event == "thought" || msg.Type == "thought") && msg.Delta != "" {
+						thoughtText = msg.Delta
+					}
+				}
+				if thoughtText != "" && streamCallback != nil {
+					streamCallback("thought:" + thoughtText)
+				}
+
+				if msg.StepUpdate != nil {
+					toolName := msg.StepUpdate.ToolName
+					var toolArgs string
+					if msg.StepUpdate.ToolInfo != nil {
+						if toolName == "" {
+							toolName = msg.StepUpdate.ToolInfo.Name
+						}
+						if len(msg.StepUpdate.ToolInfo.Parameters) > 0 {
+							toolArgs = string(msg.StepUpdate.ToolInfo.Parameters)
+						} else if len(msg.StepUpdate.ToolInfo.Args) > 0 {
+							toolArgs = string(msg.StepUpdate.ToolInfo.Args)
+						}
+					}
+					if toolName != "" {
+						if msg.StepUpdate.State != "DONE" {
+							msgText := "tool_start: " + toolName
+							if toolArgs != "" {
+								msgText += " " + toolArgs
+							}
+							if logCallback != nil {
+								logCallback(msgText)
+							}
+						} else {
+							if logCallback != nil {
+								logCallback("tool executed: " + toolName)
+							}
+						}
+					}
+				}
+
+				if msg.Event == "result" && msg.Result != nil && msg.Result.Response != "" {
+					finalResponse = msg.Result.Response
+				}
+			}
+		}
+
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
+			break
+		}
+	}
+
+	waitErr := cmd.Wait()
+	if ctx.Err() != nil {
+		return accumulatedText.String(), ctx.Err()
+	}
+
+	resultText := finalResponse
+	if resultText == "" {
+		resultText = accumulatedText.String()
+	}
+
+	if waitErr != nil && resultText == "" {
+		errMsg := waitErr.Error()
+		if stderrBuf.Len() > 0 {
+			errMsg = fmt.Sprintf("%s: %s", errMsg, strings.TrimSpace(stderrBuf.String()))
+		}
+		return "", errors.New(errMsg)
+	}
+
+	return resultText, nil
 }
