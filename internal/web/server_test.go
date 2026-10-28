@@ -85,7 +85,7 @@ func TestProjectsEndpoint(t *testing.T) {
 		t.Fatalf("expected status ok, got: %s", parsed.Status)
 	}
 
-	expected := []string{"CITEOAI", "gowa", "proskillai", "CLI Project"}
+	expected := []string{"CITEOAI"}
 	if len(parsed.Projects) != len(expected) {
 		t.Fatalf("expected %d projects, got %d", len(expected), len(parsed.Projects))
 	}
@@ -122,8 +122,11 @@ func TestSessionsEndpoint(t *testing.T) {
 	if parsed.Status != "ok" {
 		t.Fatalf("expected status ok, got: %s", parsed.Status)
 	}
-	if len(parsed.Sessions) == 0 {
-		t.Fatalf("expected non-empty sessions")
+	if len(parsed.Sessions) != 1 {
+		t.Fatalf("expected 1 session, got: %d", len(parsed.Sessions))
+	}
+	if parsed.Sessions[0].ID != "sess_default" || parsed.Sessions[0].Project != "CITEOAI" || parsed.Sessions[0].Title != "Main Session" {
+		t.Fatalf("unexpected session content: %+v", parsed.Sessions[0])
 	}
 }
 
@@ -229,8 +232,8 @@ func TestWebSocketListProjects(t *testing.T) {
 		t.Fatalf("expected type projects, got: %s", resp.Type)
 	}
 
-	if len(resp.Projects) < 4 {
-		t.Fatalf("expected at least 4 projects, got: %d", len(resp.Projects))
+	if len(resp.Projects) != 1 || resp.Projects[0] != "CITEOAI" {
+		t.Fatalf("expected 1 project [CITEOAI], got: %v", resp.Projects)
 	}
 }
 
@@ -260,8 +263,8 @@ func TestWebSocketListSessions(t *testing.T) {
 		t.Fatalf("expected type sessions, got: %s", resp.Type)
 	}
 
-	if len(resp.Sessions) < 4 {
-		t.Fatalf("expected at least 4 sessions, got: %d", len(resp.Sessions))
+	if len(resp.Sessions) != 1 || resp.Sessions[0].ID != "sess_default" {
+		t.Fatalf("expected 1 session [sess_default], got: %v", resp.Sessions)
 	}
 }
 
@@ -279,7 +282,7 @@ func TestWebSocketNewSession(t *testing.T) {
 
 	req := ClientMessage{
 		Type:    "new_session",
-		Project: "proskillai",
+		Project: "CITEOAI",
 	}
 	if err := websocket.JSON.Send(ws, req); err != nil {
 		t.Fatalf("send error: %v", err)
@@ -294,7 +297,7 @@ func TestWebSocketNewSession(t *testing.T) {
 		t.Fatalf("expected type session_created, got: %s", resp.Type)
 	}
 
-	if len(resp.Sessions) != 1 || resp.Sessions[0].Project != "proskillai" {
+	if len(resp.Sessions) != 1 || resp.Sessions[0].Project != "CITEOAI" {
 		t.Fatalf("unexpected new session payload: %+v", resp.Sessions)
 	}
 }
@@ -532,10 +535,154 @@ func TestServerConfigAndAccessors(t *testing.T) {
 
 	srv.AddProject("NewProject")
 	projects := srv.ListProjects()
-	if len(projects) != 5 || projects[4] != "NewProject" {
+	if len(projects) != 2 || projects[1] != "NewProject" {
 		t.Errorf("expected NewProject added, got: %v", projects)
 	}
 
 	newRunner := &mockTurnRunner{}
 	srv.SetRunner(newRunner)
+}
+
+func TestFileEndpointSuccess(t *testing.T) {
+	srv := NewServer(ServerConfig{}, nil)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/api/file?path=server.go")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200, got: %d", resp.StatusCode)
+	}
+
+	var parsed struct {
+		Status  string `json:"status"`
+		Path    string `json:"path"`
+		Content string `json:"content"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		t.Fatalf("json decode error: %v", err)
+	}
+
+	if parsed.Status != "ok" {
+		t.Fatalf("expected status ok, got: %s", parsed.Status)
+	}
+	if parsed.Path != "server.go" {
+		t.Fatalf("expected path server.go, got: %s", parsed.Path)
+	}
+	if !strings.Contains(parsed.Content, "package web") {
+		t.Fatalf("expected content to contain package web, got: %s", parsed.Content)
+	}
+}
+
+func TestFileEndpointNotFound(t *testing.T) {
+	srv := NewServer(ServerConfig{}, nil)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/api/file?path=does_not_exist_file.txt")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200, got: %d", resp.StatusCode)
+	}
+
+	var parsed struct {
+		Status string `json:"status"`
+		Error  string `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		t.Fatalf("json decode error: %v", err)
+	}
+
+	if parsed.Status != "error" {
+		t.Fatalf("expected status error, got: %s", parsed.Status)
+	}
+	if parsed.Error != "file not found" {
+		t.Fatalf("expected error 'file not found', got: %s", parsed.Error)
+	}
+}
+
+func TestFileEndpointPathTraversal(t *testing.T) {
+	srv := NewServer(ServerConfig{}, nil)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	traversalPaths := []string{
+		"../../../../etc/passwd",
+		"/etc/passwd",
+		"internal/../../../../etc/shadow",
+		"..",
+		".",
+	}
+
+	for _, p := range traversalPaths {
+		resp, err := http.Get(ts.URL + "/api/file?path=" + p)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var parsed struct {
+			Status string `json:"status"`
+			Error  string `json:"error"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+			resp.Body.Close()
+			t.Fatalf("json decode error: %v", err)
+		}
+		resp.Body.Close()
+
+		if parsed.Status != "error" {
+			t.Fatalf("expected status error for path %s, got: %s", p, parsed.Status)
+		}
+		if parsed.Error != "file not found" {
+			t.Fatalf("expected error 'file not found' for path %s, got: %s", p, parsed.Error)
+		}
+	}
+}
+
+func TestFileEndpointEmptyPath(t *testing.T) {
+	srv := NewServer(ServerConfig{}, nil)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/api/file")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var parsed struct {
+		Status string `json:"status"`
+		Error  string `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		t.Fatalf("json decode error: %v", err)
+	}
+
+	if parsed.Status != "error" || parsed.Error != "file not found" {
+		t.Fatalf("unexpected response: %+v", parsed)
+	}
+}
+
+func TestFileEndpointMethodNotAllowed(t *testing.T) {
+	srv := NewServer(ServerConfig{}, nil)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	resp, err := http.Post(ts.URL+"/api/file?path=go.mod", "application/json", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("expected status 405, got: %d", resp.StatusCode)
+	}
 }

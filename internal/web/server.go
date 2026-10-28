@@ -36,6 +36,7 @@ type ClientMessage struct {
 
 type ServerEvent struct {
 	Type      string    `json:"type"`
+	SessionID string    `json:"session_id,omitempty"`
 	Delta     string    `json:"delta,omitempty"`
 	Name      string    `json:"name,omitempty"`
 	Args      string    `json:"args,omitempty"`
@@ -45,6 +46,13 @@ type ServerEvent struct {
 	Error     string    `json:"error,omitempty"`
 	Projects  []string  `json:"projects,omitempty"`
 	Sessions  []Session `json:"sessions,omitempty"`
+}
+
+type fileResponse struct {
+	Status  string `json:"status"`
+	Path    string `json:"path,omitempty"`
+	Content string `json:"content,omitempty"`
+	Error   string `json:"error,omitempty"`
 }
 
 type Session struct {
@@ -78,35 +86,14 @@ func NewServer(cfg ServerConfig, runner TurnRunner) *Server {
 
 	defaultProjects := []string{
 		"CITEOAI",
-		"gowa",
-		"proskillai",
-		"CLI Project",
 	}
 
 	defaultSessions := []Session{
 		{
-			ID:        "sess_citeoai_1",
+			ID:        "sess_default",
 			Project:   "CITEOAI",
-			Title:     "CITEOAI Engine Implementation Setup",
-			UpdatedAt: "7m",
-		},
-		{
-			ID:        "sess_gowa_1",
-			Project:   "gowa",
-			Title:     "WhatsApp Multi-Device Bridge",
-			UpdatedAt: "2d",
-		},
-		{
-			ID:        "sess_proskillai_1",
-			Project:   "proskillai",
-			Title:     "Assessment Pipeline Architecture",
-			UpdatedAt: "5d",
-		},
-		{
-			ID:        "sess_cli_1",
-			Project:   "CLI Project",
-			Title:     "Autonomous CLI Orchestrator",
-			UpdatedAt: "1w",
+			Title:     "Main Session",
+			UpdatedAt: "now",
 		},
 	}
 
@@ -175,6 +162,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/health", s.handleHealth)
 	mux.HandleFunc("/api/projects", s.handleProjects)
 	mux.HandleFunc("/api/sessions", s.handleSessions)
+	mux.HandleFunc("/api/file", s.handleFile)
 	mux.HandleFunc("/", s.handleStaticOrFallback)
 
 	return mux
@@ -255,6 +243,96 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 	}{
 		Status:   "ok",
 		Sessions: sessions,
+	}
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+
+	filePath := r.URL.Query().Get("path")
+	if filePath == "" {
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(fileResponse{
+			Status: "error",
+			Error:  "file not found",
+		})
+		return
+	}
+
+	wd, err := os.Getwd()
+	if err != nil {
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(fileResponse{
+			Status: "error",
+			Error:  "file not found",
+		})
+		return
+	}
+
+	if realWd, err := filepath.EvalSymlinks(wd); err == nil {
+		wd = realWd
+	}
+
+	cleanedPath := filepath.Clean(filePath)
+	var targetPath string
+	if filepath.IsAbs(cleanedPath) {
+		targetPath = cleanedPath
+	} else {
+		targetPath = filepath.Join(wd, cleanedPath)
+	}
+
+	rel, err := filepath.Rel(wd, targetPath)
+	if err != nil || strings.HasPrefix(rel, "..") || rel == ".." {
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(fileResponse{
+			Status: "error",
+			Error:  "file not found",
+		})
+		return
+	}
+
+	info, err := os.Stat(targetPath)
+	if err != nil || info.IsDir() {
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(fileResponse{
+			Status: "error",
+			Error:  "file not found",
+		})
+		return
+	}
+
+	if realTarget, err := filepath.EvalSymlinks(targetPath); err == nil {
+		realRel, relErr := filepath.Rel(wd, realTarget)
+		if relErr != nil || strings.HasPrefix(realRel, "..") || realRel == ".." {
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(fileResponse{
+				Status: "error",
+				Error:  "file not found",
+			})
+			return
+		}
+	}
+
+	data, err := os.ReadFile(targetPath)
+	if err != nil {
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(fileResponse{
+			Status: "error",
+			Error:  "file not found",
+		})
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	resp := fileResponse{
+		Status:  "ok",
+		Path:    filePath,
+		Content: string(data),
 	}
 	_ = json.NewEncoder(w).Encode(resp)
 }
@@ -356,12 +434,12 @@ func (s *Server) handleWebSocket(ws *websocket.Conn) {
 			if promptText == "" {
 				promptText = msg.Prompt
 			}
-			s.executePrompt(ws.Request().Context(), promptText, sendEvent)
+			s.executePrompt(ws.Request().Context(), msg.SessionID, promptText, sendEvent)
 		}
 	}
 }
 
-func (s *Server) executePrompt(ctx context.Context, promptText string, sendEvent func(ServerEvent) error) {
+func (s *Server) executePrompt(ctx context.Context, sessionID string, promptText string, sendEvent func(ServerEvent) error) {
 	s.mu.RLock()
 	runner := s.runner
 	s.mu.RUnlock()
@@ -369,6 +447,7 @@ func (s *Server) executePrompt(ctx context.Context, promptText string, sendEvent
 	if runner == nil {
 		_ = sendEvent(ServerEvent{
 			Type:      "done",
+			SessionID: sessionID,
 			FinalText: "Error: runner not configured",
 			Error:     "runner not configured",
 		})
@@ -384,8 +463,9 @@ func (s *Server) executePrompt(ctx context.Context, promptText string, sendEvent
 
 		if strings.HasPrefix(token, "thought:") {
 			_ = sendEvent(ServerEvent{
-				Type:  "thought",
-				Delta: strings.TrimPrefix(token, "thought:"),
+				Type:      "thought",
+				SessionID: sessionID,
+				Delta:     strings.TrimPrefix(token, "thought:"),
 			})
 			return
 		}
@@ -406,16 +486,18 @@ func (s *Server) executePrompt(ctx context.Context, promptText string, sendEvent
 					thoughtChunk := remaining[:endIdx]
 					if len(thoughtChunk) > 0 {
 						_ = sendEvent(ServerEvent{
-							Type:  "thought",
-							Delta: thoughtChunk,
+							Type:      "thought",
+							SessionID: sessionID,
+							Delta:     thoughtChunk,
 						})
 					}
 					inThought = false
 					remaining = remaining[endIdx+tagLen:]
 				} else {
 					_ = sendEvent(ServerEvent{
-						Type:  "thought",
-						Delta: remaining,
+						Type:      "thought",
+						SessionID: sessionID,
+						Delta:     remaining,
 					})
 					remaining = ""
 				}
@@ -433,16 +515,18 @@ func (s *Server) executePrompt(ctx context.Context, promptText string, sendEvent
 					textChunk := remaining[:startIdx]
 					if len(textChunk) > 0 {
 						_ = sendEvent(ServerEvent{
-							Type:  "token",
-							Delta: textChunk,
+							Type:      "token",
+							SessionID: sessionID,
+							Delta:     textChunk,
 						})
 					}
 					inThought = true
 					remaining = remaining[startIdx+tagLen:]
 				} else {
 					_ = sendEvent(ServerEvent{
-						Type:  "token",
-						Delta: remaining,
+						Type:      "token",
+						SessionID: sessionID,
+						Delta:     remaining,
 					})
 					remaining = ""
 				}
@@ -452,8 +536,9 @@ func (s *Server) executePrompt(ctx context.Context, promptText string, sendEvent
 
 	logCallback := func(entry string) {
 		_ = sendEvent(ServerEvent{
-			Type:   "tool_log",
-			Output: entry,
+			Type:      "tool_log",
+			SessionID: sessionID,
+			Output:    entry,
 		})
 
 		trimmed := strings.TrimSpace(entry)
@@ -461,26 +546,29 @@ func (s *Server) executePrompt(ctx context.Context, promptText string, sendEvent
 			payload := strings.TrimPrefix(trimmed, "tool request: ")
 			name, args := parseToolNameAndArgs(payload)
 			_ = sendEvent(ServerEvent{
-				Type: "tool_start",
-				Name: name,
-				Args: args,
+				Type:      "tool_start",
+				SessionID: sessionID,
+				Name:      name,
+				Args:      args,
 			})
 		} else if strings.HasPrefix(trimmed, "tool_start: ") {
 			payload := strings.TrimPrefix(trimmed, "tool_start: ")
 			name, args := parseToolNameAndArgs(payload)
 			_ = sendEvent(ServerEvent{
-				Type: "tool_start",
-				Name: name,
-				Args: args,
+				Type:      "tool_start",
+				SessionID: sessionID,
+				Name:      name,
+				Args:      args,
 			})
 		} else if strings.HasPrefix(trimmed, "tool executed: ") {
 			payload := strings.TrimPrefix(trimmed, "tool executed: ")
 			name := strings.TrimSpace(strings.Split(payload, " ")[0])
 			success := true
 			_ = sendEvent(ServerEvent{
-				Type:    "tool_end",
-				Name:    name,
-				Success: &success,
+				Type:      "tool_end",
+				SessionID: sessionID,
+				Name:      name,
+				Success:   &success,
 			})
 		} else if strings.HasPrefix(trimmed, "tool_end: ") {
 			payload := strings.TrimPrefix(trimmed, "tool_end: ")
@@ -491,32 +579,36 @@ func (s *Server) executePrompt(ctx context.Context, promptText string, sendEvent
 				success = false
 			}
 			_ = sendEvent(ServerEvent{
-				Type:    "tool_end",
-				Name:    name,
-				Success: &success,
+				Type:      "tool_end",
+				SessionID: sessionID,
+				Name:      name,
+				Success:   &success,
 			})
 		} else if strings.HasPrefix(trimmed, "security gate denied: ") {
 			payload := strings.TrimPrefix(trimmed, "security gate denied: ")
 			name := strings.TrimSpace(strings.Split(payload, " ")[0])
 			success := false
 			_ = sendEvent(ServerEvent{
-				Type:    "tool_end",
-				Name:    name,
-				Success: &success,
+				Type:      "tool_end",
+				SessionID: sessionID,
+				Name:      name,
+				Success:   &success,
 			})
 		} else if strings.HasPrefix(trimmed, "duplicate failure guard triggered: ") {
 			payload := strings.TrimPrefix(trimmed, "duplicate failure guard triggered: ")
 			name := strings.TrimSpace(strings.Split(payload, " ")[0])
 			success := false
 			_ = sendEvent(ServerEvent{
-				Type:    "tool_end",
-				Name:    name,
-				Success: &success,
+				Type:      "tool_end",
+				SessionID: sessionID,
+				Name:      name,
+				Success:   &success,
 			})
 		} else if strings.HasPrefix(trimmed, "thought: ") {
 			_ = sendEvent(ServerEvent{
-				Type:  "thought",
-				Delta: strings.TrimPrefix(trimmed, "thought: "),
+				Type:      "thought",
+				SessionID: sessionID,
+				Delta:     strings.TrimPrefix(trimmed, "thought: "),
 			})
 		}
 	}
@@ -525,6 +617,7 @@ func (s *Server) executePrompt(ctx context.Context, promptText string, sendEvent
 	if err != nil {
 		_ = sendEvent(ServerEvent{
 			Type:      "done",
+			SessionID: sessionID,
 			FinalText: result,
 			Error:     err.Error(),
 		})
@@ -533,6 +626,7 @@ func (s *Server) executePrompt(ctx context.Context, promptText string, sendEvent
 
 	_ = sendEvent(ServerEvent{
 		Type:      "done",
+		SessionID: sessionID,
 		FinalText: result,
 	})
 }
